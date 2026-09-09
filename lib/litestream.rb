@@ -107,20 +107,26 @@ module Litestream
     end
 
     def databases
-      databases = Commands.databases
+      databases = Commands.databases(json: true)
 
       databases.each do |db|
-        generations = Commands.generations(db["path"])
-        snapshots = Commands.snapshots(db["path"])
-        db["path"] = db["path"].gsub(Rails.root.to_s, "[ROOT]")
+        path = db["path"]
+        begin
+          db["status"] = Commands.status(path, json: true).first
+          db["ltx"] = Commands.ltx(path, **{"json" => true, "--level" => "all"})
+          db["levels"] = db["ltx"].each_with_object(Hash.new(0)) { |entry, levels| levels[entry["level"]] += 1 }
+          db["snapshot"] = db["ltx"].select { |entry| entry["level"] == 9 }.max_by { |entry| entry["timestamp"] }
+          db["latest"] = db["ltx"].max_by { |entry| Integer(entry["max_txid"], 16) }
 
-        db["generations"] = generations.map do |generation|
-          id = generation["generation"]
-          replica = generation["name"]
-          generation["snapshots"] = snapshots.select { |snapshot| snapshot["generation"] == id && snapshot["replica"] == replica }
-            .map { |s| s.slice("index", "size", "created") }
-          generation.slice("generation", "name", "lag", "start", "end", "snapshots")
+          local_txid = db.dig("status", "local_txid")
+          db["lag_txids"] = if local_txid && local_txid != "-" && db["latest"]
+            Integer(local_txid, 16) - Integer(db["latest"]["max_txid"], 16)
+          end
+        rescue => error
+          db["error"] = error.message
         end
+
+        db["path"] = path.gsub(Rails.root.to_s, "[ROOT]")
       end
     end
 

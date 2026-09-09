@@ -1,4 +1,5 @@
 require_relative "upstream"
+require "json"
 
 module Litestream
   module Commands
@@ -114,22 +115,14 @@ module Litestream
         execute("databases", argv)
       end
 
-      def generations(database, **argv)
-        raise DatabaseRequiredException, "database argument is required for generations command, e.g. litestream:generations -- --database=path/to/database.sqlite" if database.nil?
+      def ltx(database, **argv)
+        raise DatabaseRequiredException, "database argument is required for ltx command, e.g. litestream:ltx -- --database=path/to/database.sqlite" if database.nil?
 
-        execute("generations", argv, database)
+        execute("ltx", argv, database)
       end
 
-      def snapshots(database, **argv)
-        raise DatabaseRequiredException, "database argument is required for snapshots command, e.g. litestream:snapshots -- --database=path/to/database.sqlite" if database.nil?
-
-        execute("snapshots", argv, database)
-      end
-
-      def wal(database, **argv)
-        raise DatabaseRequiredException, "database argument is required for wal command, e.g. litestream:wal -- --database=path/to/database.sqlite" if database.nil?
-
-        execute("wal", argv, database)
+      def status(database = nil, **argv)
+        execute("status", argv, database)
       end
 
       private
@@ -152,9 +145,11 @@ module Litestream
         ENV["LITESTREAM_ACCESS_KEY_ID"] ||= Litestream.replica_key_id
         ENV["LITESTREAM_SECRET_ACCESS_KEY"] ||= Litestream.replica_access_key
 
+        argv = argv.stringify_keys
+        argv["-json"] = nil if argv.delete("json")
         args = {
           "--config" => Litestream.config_path.to_s
-        }.merge(argv.stringify_keys).to_a.flatten.compact
+        }.merge(argv).to_a.flatten.compact
         cmd = [executable, command, *args, database].compact
         puts cmd.inspect if ENV["DEBUG"]
 
@@ -163,6 +158,7 @@ module Litestream
 
       def run(cmd, tabled_output:)
         stdout = `#{cmd.join(" ")}`.chomp
+        return JSON.parse(stdout) if cmd.include?("--json") || cmd.include?("-json")
         return stdout unless tabled_output
 
         keys, *rows = stdout.split("\n").map { _1.split(/\s+/) }

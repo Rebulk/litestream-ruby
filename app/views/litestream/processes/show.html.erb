@@ -56,62 +56,61 @@
         </div>
 
         <br />
-        <section id="generations" class="ml-6">
-          <% database['generations'].each do |generation| %>
-            <details id="<%= generation['generation'] %>" open="open">
+        <section class="ml-6">
+          <% if database['error'] %>
+            <p class="text-red-700 dark:text-red-300"><strong>Error:</strong> <%= database['error'] %></p>
+          <% else %>
+            <% status = database['status'] || {} %>
+            <p class="text-sm">
+              <strong>Status:</strong> <%= status['status'] || 'unknown' %>
+              &middot; <strong>Local TXID:</strong> <code><%= status['local_txid'] || '-' %></code>
+              &middot; <strong>WAL size:</strong> <%= status['wal_size'] || '-' %>
+            </p>
+
+            <dl class="mt-2 grid grid-cols-[fit-content(100%)_1fr] gap-x-4">
+              <dt class="font-bold">Latest TXID</dt>
+              <dd><code><%= database.dig('latest', 'max_txid') || '-' %></code></dd>
+              <dt class="font-bold">Snapshot</dt>
+              <dd>
+                <% if database['snapshot'] %>
+                  <time datetime="<%= database['snapshot']['timestamp'] %>"><%= DateTime.parse(database['snapshot']['timestamp']).to_formatted_s(:db) %></time>
+                  (<%= number_to_human_size database['snapshot']['size'] %>)
+                <% else %>
+                  none
+                <% end %>
+              </dd>
+              <dt class="font-bold">Levels</dt>
+              <dd><%= database['levels'].presence&.sort&.map { |level, count| "L#{level}: #{count}" }&.join(', ') || 'none' %></dd>
+              <dt class="font-bold">Lag</dt>
+              <dd><%= database['lag_txids'].nil? ? '-' : "#{database['lag_txids']} txids" %></dd>
+            </dl>
+
+            <details id="ltx" class="mt-2">
               <summary class="cursor-pointer rounded p-2 hover:bg-gray-50 dark:hover:bg-gray-800">
-                <code><%= generation['generation'] %></code>
-                (<em><%= generation['lag'] %> lag</em>)
+                LTX files (<%= database['ltx'].size %>)
               </summary>
-
-              <dl class="ml-7 grid grid-cols-[fit-content(100%)_1fr] gap-x-4">
-                <dt class="font-bold">Start</dt>
-                <dd class="">
-                  <abbr title="<%= generation['start'] %>" class="underline decoration-dashed decoration-gray-500 cursor-help">
-                    <time datetime="<%= generation['start'] %>"><%= DateTime.parse(generation['start']).to_formatted_s(:db) %></time>
-                  </abbr>
-                </dd>
-
-                <dt class="font-bold">End</dt>
-                <dd class="">
-                  <abbr title="<%= generation['end'] %>" class="underline decoration-dashed decoration-gray-500 cursor-help">
-                    <time datetime="<%= generation['end'] %>"><%= DateTime.parse(generation['end']).to_formatted_s(:db) %></time>
-                  </abbr>
-                </dd>
-
-                <div class="col-span-2">
-                  <dt class="font-bold">Snapshots</dt>
-                  <dd class="">
-                    <table class="min-w-full divide-y divide-gray-300">
-                      <thead>
-                        <tr>
-                          <th scope="col" class="whitespace-nowrap px-2 py-2 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Created at</th>
-                          <th scope="col" class="whitespace-nowrap px-2 py-2 text-right text-sm font-semibold text-gray-900 dark:text-gray-100">Index</th>
-                          <th scope="col" class="whitespace-nowrap px-2 py-2 text-right text-sm font-semibold text-gray-900 dark:text-gray-100">Size</th>
-                        </tr>
-                      </thead>
-
-                      <tbody class="bg-white dark:bg-gray-900">
-                        <% generation['snapshots'].each do |snapshot| %>
-                          <tr class="align-top even:bg-gray-50 dark:even:bg-gray-800">
-                            <td scope="col" class="whitespace-nowrap px-2 py-2 text-sm text-gray-900 dark:text-gray-100">
-                              <abbr title="<%= snapshot['created'] %>" class="underline decoration-dashed decoration-gray-500 cursor-help">
-                                <time datetime="<%= snapshot['created'] %>"><%= DateTime.parse(snapshot['created']).to_formatted_s(:db) %></time>
-                              </abbr>
-                            </td>
-                            <td scope="col" class="whitespace-nowrap px-2 py-2 text-sm text-gray-900 dark:text-gray-100 text-right">
-                              <%= snapshot['index'] %>
-                            </td>
-                            <td scope="col" class="whitespace-nowrap px-2 py-2 text-sm text-gray-900 dark:text-gray-100 text-right">
-                              <%= number_to_human_size snapshot['size'] %>
-                            </td>
-                          </tr>
-                        <% end %>
-                      </tbody>
-                    </table>
-                  </dd>
-                </div>
-              </dl>
+              <table class="min-w-full divide-y divide-gray-300">
+                <thead>
+                  <tr>
+                    <th scope="col" class="whitespace-nowrap px-2 py-2 text-right text-sm font-semibold text-gray-900 dark:text-gray-100">Level</th>
+                    <th scope="col" class="whitespace-nowrap px-2 py-2 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">TXID range</th>
+                    <th scope="col" class="whitespace-nowrap px-2 py-2 text-right text-sm font-semibold text-gray-900 dark:text-gray-100">Size</th>
+                    <th scope="col" class="whitespace-nowrap px-2 py-2 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Created</th>
+                  </tr>
+                </thead>
+                <tbody class="bg-white dark:bg-gray-900">
+                  <% database['ltx'].each do |ltx| %>
+                    <tr class="align-top even:bg-gray-50 dark:even:bg-gray-800">
+                      <td class="whitespace-nowrap px-2 py-2 text-sm text-right text-gray-900 dark:text-gray-100"><%= ltx['level'] %></td>
+                      <td class="whitespace-nowrap px-2 py-2 text-sm text-gray-900 dark:text-gray-100"><code><%= ltx['min_txid'] %>&ndash;<%= ltx['max_txid'] %></code></td>
+                      <td class="whitespace-nowrap px-2 py-2 text-sm text-right text-gray-900 dark:text-gray-100"><%= number_to_human_size ltx['size'] %></td>
+                      <td class="whitespace-nowrap px-2 py-2 text-sm text-gray-900 dark:text-gray-100">
+                        <time datetime="<%= ltx['timestamp'] %>"><%= DateTime.parse(ltx['timestamp']).to_formatted_s(:db) %></time>
+                      </td>
+                    </tr>
+                  <% end %>
+                </tbody>
+              </table>
             </details>
           <% end %>
         </section>

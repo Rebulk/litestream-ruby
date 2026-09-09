@@ -5,17 +5,15 @@ class Litestream::TestProcessesController < ActionDispatch::IntegrationTest
     stubbed_process = {pid: "12345", status: "sleeping", started: DateTime.now}
     stubbed_databases = [
       {"path" => "[ROOT]/storage/test.sqlite3",
-       "replicas" => "s3",
-       "generations" => [
-         {"generation" => SecureRandom.hex,
-          "name" => "s3",
-          "lag" => "23h59m59s",
-          "start" => "2024-05-02T11:32:16Z",
-          "end" => "2024-05-02T11:33:10Z",
-          "snapshots" => [
-            {"index" => "0", "size" => "4145735", "created" => "2024-05-02T11:32:16Z"}
-          ]}
-       ]}
+       "replica" => "s3",
+       "status" => {"status" => "ok", "local_txid" => "000000000000000a", "wal_size" => "128 kB"},
+       "ltx" => [
+         {"level" => 9, "min_txid" => "0000000000000001", "max_txid" => "0000000000000009", "size" => 4_145_735, "timestamp" => "2026-09-08T03:16:43Z"}
+       ],
+       "levels" => {9 => 1},
+       "snapshot" => {"level" => 9, "max_txid" => "0000000000000009", "size" => 4_145_735, "timestamp" => "2026-09-08T03:16:43Z"},
+       "latest" => {"level" => 9, "max_txid" => "0000000000000009"},
+       "lag_txids" => 1}
     ]
     Litestream.stub :replicate_process, stubbed_process do
       Litestream.stub :databases, stubbed_databases do
@@ -30,7 +28,11 @@ class Litestream::TestProcessesController < ActionDispatch::IntegrationTest
 
         assert_select "#databases li", 1 do
           assert_select "h2 code", stubbed_databases[0]["path"]
-          assert_select "details##{stubbed_databases[0]["generations"][0]["generation"]}"
+          assert_select "p", /Status:.*ok/
+          assert_select "details#ltx"
+          assert_select "tbody tr", 1
+          assert_select "td", "9"
+          assert_select "code", /0000000000000001.*0000000000000009/
         end
       end
     end
