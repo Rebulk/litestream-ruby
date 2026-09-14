@@ -163,6 +163,36 @@ class TestCommands < ActiveSupport::TestCase
       assert_equal "original_key", ENV["LITESTREAM_ACCESS_KEY_ID"]
       assert_equal "original_access", ENV["LITESTREAM_SECRET_ACCESS_KEY"]
     end
+
+    # These run a real child, and Litestream.replicate_process reads the global
+    # $? straight after backticks that its own tests stub out, so a failed or
+    # signalled status left here surfaces over there. Leave a clean one behind.
+    def teardown
+      super
+      system("true")
+    end
+
+    def test_replicate_in_process_raises_when_litestream_exits_non_zero
+      error = assert_raises Litestream::Commands::CommandFailedException do
+        Litestream::Commands.send(:run_replicate, ["/bin/sh", "-c", "echo boom; exit 3"], async: false)
+      end
+
+      assert_match "exit status 3", error.message
+    end
+
+    def test_replicate_in_process_does_not_raise_when_litestream_is_signalled
+      Litestream::Commands.send(:run_replicate, ["/bin/sh", "-c", "kill -TERM $$"], async: false)
+    end
+
+    def test_replicate_reports_the_exit_status_rather_than_the_command
+      error = assert_raises Litestream::Commands::CommandFailedException do
+        Litestream::Commands.stub :prepare, ["/bin/sh", "-c", "exit 3"] do
+          Litestream::Commands.replicate
+        end
+      end
+
+      assert_match "exit status 3", error.message
+    end
   end
 
   class TestRestoreCommand < TestCommands

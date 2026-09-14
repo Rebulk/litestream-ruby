@@ -108,6 +108,8 @@ module Litestream
       def replicate(async: false, **argv)
         cmd = prepare("replicate", argv)
         run_replicate(cmd, async: async)
+      rescue CommandFailedException
+        raise
       rescue
         raise CommandFailedException, "Failed to execute `#{cmd.join(" ")}`"
       end
@@ -242,6 +244,14 @@ module Litestream
           # When running in-process, we capture output continuously and write to stdout.
           IO.popen(cmd, err: [:child, :out]) do |io|
             io.each_line { |line| puts line }
+          end
+          status = $?
+          # `replicate` runs until it is signalled, so a signal is how it is
+          # meant to end. A non-zero exit is litestream failing to start or
+          # dying on its own, which is invisible today: the task exits 0 and a
+          # supervisor sees a clean stop rather than a crash to restart.
+          if status && !status.success? && !status.signaled?
+            raise CommandFailedException, "Failed to execute `replicate` (exit status #{status.exitstatus})"
           end
         end
       end
