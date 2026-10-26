@@ -1,6 +1,7 @@
 require "test_helper"
 require "fileutils"
 require "tmpdir"
+require_relative "../support/fake_litestream"
 
 class TestCommands < ActiveSupport::TestCase
   def run
@@ -813,6 +814,9 @@ class TestReplicateProcess < ActiveSupport::TestCase
       # normal exit status behind for tests that read $? after a stubbed command.
       File.write(executable, "#!/bin/sh\ntrap 'exit 0' INT TERM\necho $$ > #{pid_file}\nwhile :; do sleep 1; done\n")
       File.chmod(0o755, executable)
+      # replicate locks the databases in the config, so keep the lock file in here.
+      Litestream.config_path = File.join(dir, "litestream.yml")
+      File.write(Litestream.config_path, "dbs:\n  - path: #{dir}/test.sqlite3\n")
 
       Litestream::Commands.stub :executable, executable do
         pid = Litestream::Commands.replicate(async: true)
@@ -825,7 +829,285 @@ class TestReplicateProcess < ActiveSupport::TestCase
           Process.wait(pid)
           assert_raises(Errno::ECHILD) { Process.wait(pid, Process::WNOHANG) }
         end
+        Litestream.config_path = nil
       end
     end
+  end
+end
+
+class TestReplicateLock < ActiveSupport::TestCase
+  include FakeLitestream
+
+  def setup
+    setup_fake_litestream
+  end
+
+  def teardown
+    teardown_fake_litestream
+    # Leave a clean $? for the tests that read it after a stubbed command.
+    system("true")
+  end
+
+  # Stubbed once around the whole test: a stub taken and restored inside each
+  # of several threads would restore over another thread's.
+  def run
+    result = nil
+    capture_io { Litestream::Commands.stub(:executable, ->(**) { @executable || raise(Litestream::Commands::ExecutableNotFoundException) }) { result = super } }
+    result
+  end
+
+  def replicate(**options)
+    Litestream::Commands.replicate(**options)
+  end
+
+  def test_a_second_replicate_waits_until_the_first_exits
+    first = replicate(async: true)
+    assert wait_for { started_pids == [first] }
+
+    second = Thread.new { replicate(async: true) }
+    sleep 1
+    assert second.alive?, "the second replicate should wait for the lock"
+    assert_equal ["start #{first}"], log_lines
+
+    Process.kill(:TERM, first)
+    Process.wait(first)
+    assert second.join(5), "the second replicate should start once the first exits"
+    pid = second.value
+    assert wait_for { started_pids.include?(pid) }
+
+    assert_equal ["start #{first}", "stop #{first}", "start #{pid}"], log_lines
+  ensure
+    second&.kill
+    [first, pid].compact.each do |p|
+      Process.kill(:TERM, p)
+      Process.wait(p)
+    rescue Errno::ESRCH, Errno::ECHILD
+    end
+  end
+
+  def test_a_foreground_replicate_as_the_rake_task_runs_waits_too
+    first = replicate(async: true)
+    assert wait_for { started_pids == [first] }
+
+    second = Thread.new { replicate }
+    sleep 1
+    assert second.alive?
+    assert_equal ["start #{first}"], log_lines
+
+    Process.kill(:TERM, first)
+    Process.wait(first)
+    assert wait_for { started_pids.size == 2 }, "the foreground replicate should start once the first exits"
+    Process.kill(:TERM, started_pids.last)
+    assert second.join(5)
+
+    assert_equal ["start #{first}", "stop #{first}", "start #{started_pids.last}", "stop #{started_pids.last}"], log_lines
+  ensure
+    second&.kill
+    begin
+      Process.kill(:TERM, first)
+      Process.wait(first)
+    rescue Errno::ESRCH, Errno::ECHILD
+    end
+  end
+
+  # The lock has to live as long as litestream, not as long as Puma or rake: a
+  # litestream left running by a SIGKILLed parent still replicates.
+  def test_the_lock_stays_with_litestream_when_puma_is_killed
+    assert_lock_outlives_a_killed_parent("Litestream::Commands.replicate(async: true); sleep")
+  end
+
+  # Real litestream logs to the pipe the rake task read, so it dies of SIGPIPE
+  # on its next log line once the task is gone; until then it still holds the
+  # lock. The fake here never writes, so it stands for that window.
+  def test_the_lock_stays_with_litestream_until_it_exits_when_the_rake_task_is_killed
+    assert_lock_outlives_a_killed_parent("Litestream::Commands.replicate")
+  end
+
+  def assert_lock_outlives_a_killed_parent(call)
+    script = <<~RUBY
+      require "active_support/all"
+      require "litestream"
+      Litestream.config_path = #{@config.inspect}
+      Litestream::Commands.singleton_class.define_method(:executable) { |**| #{@executable.inspect} }
+      #{call}
+    RUBY
+    stderr = File.join(@dir, "parent_stderr")
+    parent = Process.spawn(RbConfig.ruby, "-I", File.expand_path("../../lib", __dir__), "-e", script, out: File::NULL, err: stderr)
+    assert wait_for { started_pids.any? }, -> { File.read(stderr) }
+    litestream = started_pids.first
+
+    Process.kill(:KILL, parent)
+    Process.wait(parent)
+    parent = nil
+
+    refute lock_free?, "litestream should still hold the lock after its parent was killed"
+    Process.kill(:TERM, litestream)
+    assert wait_for { lock_free? }, "the lock should be released when litestream exits"
+  ensure
+    if parent
+      Process.kill(:KILL, parent)
+      Process.wait(parent)
+    end
+  end
+
+  def test_the_lock_is_not_held_once_litestream_exits_on_its_own
+    pid = replicate(async: true)
+    assert wait_for { started_pids == [pid] }
+    refute lock_free?
+
+    Process.kill(:TERM, pid)
+    Process.wait(pid)
+
+    assert lock_free?
+  end
+
+  def lock_paths(config = @config, *flags)
+    Litestream::Commands.send(:lock_paths, ["litestream", "replicate", "--config", config, *flags])
+  end
+
+  def test_each_database_gets_a_lock_beside_its_litestream_directory
+    ENV["LITESTREAM_TEST_STORAGE"] = File.join(@dir, "env")
+    File.write(@config, <<~YAML)
+      dbs:
+        - path: $LITESTREAM_TEST_STORAGE/production.sqlite3
+        - path: sqlite3://#{@dir}/queue.sqlite3
+        - path: relative.sqlite3
+    YAML
+
+    paths = Dir.chdir(@dir) { lock_paths }
+
+    assert_equal [
+      File.join(@dir, "env", ".production.sqlite3-litestream.lock"),
+      File.join(@dir, ".queue.sqlite3-litestream.lock"),
+      File.join(@dir, ".relative.sqlite3-litestream.lock")
+    ], paths
+  ensure
+    ENV.delete("LITESTREAM_TEST_STORAGE")
+  end
+
+  # Beside its directory would be outside the volume a `dir:` usually is, so
+  # each container would lock a file of its own, if it could create one.
+  def test_a_directory_entry_is_locked_inside_the_directory
+    File.write(@config, <<~YAML)
+      dbs:
+        - dir: storage
+          pattern: "*.sqlite3"
+    YAML
+
+    assert_equal [File.join(@dir, "storage", ".litestream.lock")], Dir.chdir(@dir) { lock_paths }
+  end
+
+  # meta-path is how a database in a directory the app can't write is set up,
+  # so the lock goes where Litestream keeps its state.
+  def test_the_lock_goes_beside_meta_path_or_in_meta_dir
+    File.write(@config, <<~YAML)
+      dbs:
+        - path: #{@dir}/readonly/production.sqlite3
+          meta-path: #{@dir}/meta/production
+        - dir: #{@dir}/tenants
+          pattern: "*.sqlite3"
+          meta-dir: #{@dir}/tenant-meta
+    YAML
+
+    assert_equal [File.join(@dir, "meta", "production.lock"), File.join(@dir, "tenant-meta", ".litestream.lock")], lock_paths
+  end
+
+  def test_no_expand_env_leaves_variables_in_the_path
+    File.write(@config, "dbs:\n  - path: #{@dir}/$NAME.sqlite3\n")
+
+    assert_equal [File.join(@dir, ".$NAME.sqlite3-litestream.lock")], lock_paths(@config, "--no-expand-env")
+  end
+
+  # Go's YAML reads these as strings, so Litestream accepts them.
+  def test_a_config_litestream_accepts_is_not_refused_for_its_yaml
+    File.write(@config, <<~YAML)
+      logging:
+        level: :debug
+      defaults: &defaults
+        replica: {type: file, path: #{@dir}/replica}
+      dbs:
+        - <<: *defaults
+          path: #{@database}
+          snapshot: {interval: 2026-01-01}
+    YAML
+
+    assert_equal [@lock_path], lock_paths
+  end
+
+  def test_a_dbs_hash_is_left_for_litestream_to_refuse
+    File.write(@config, "dbs:\n  production:\n    path: #{@database}\n")
+
+    assert_equal [], lock_paths
+  end
+
+  def test_logs_once_while_waiting_and_once_when_locked
+    hold_lock
+    waiter = Thread.new { replicate(async: true) }
+    _out, err = capture_io do
+      sleep 1.2
+      release_lock
+      waiter.join(5)
+    end
+
+    assert_equal 1, err.scan("Waiting for #{@lock_path}").size
+    assert_equal 1, err.scan("Locked #{@lock_path}").size
+  ensure
+    waiter&.kill
+  end
+
+  # A Puma master that forks a worker while it waits would pass the worker a
+  # held lock, which then outlives litestream.
+  def test_holds_nothing_open_while_waiting
+    hold_lock
+    waiter = Thread.new { replicate(async: true) }
+    sleep 0.3
+
+    assert waiter.alive?
+    assert_empty open_lock_descriptors
+  ensure
+    waiter&.kill
+    waiter&.join
+  end
+
+  def test_a_child_forked_while_waiting_does_not_keep_the_lock
+    hold_lock
+    waiter = Thread.new { replicate(async: true) }
+    sleep 0.3
+    # The test's own holder is closed in the child as a Puma worker never had it.
+    worker = fork do
+      @held_lock.close
+      sleep 30
+    end
+    release_lock
+    assert waiter.join(5)
+    pid = waiter.value
+
+    Process.kill(:TERM, pid)
+    Process.wait(pid)
+
+    assert lock_free?, "a process forked while waiting should not hold the lock after litestream exits"
+  ensure
+    if worker
+      Process.kill(:KILL, worker)
+      Process.wait(worker)
+    end
+  end
+
+  def test_the_lock_is_released_when_several_are_taken_and_one_is_busy
+    other = File.join(@dir, "other.sqlite3")
+    File.write(@config, "dbs:\n  - path: #{@database}\n  - path: #{other}\n")
+    hold_lock
+    waiter = Thread.new { replicate(async: true) }
+    sleep 0.3
+
+    other_lock = File.join(@dir, ".other.sqlite3-litestream.lock")
+    assert File.open(other_lock, File::RDONLY) { _1.flock(File::LOCK_EX | File::LOCK_NB) }, "a free lock should not be held while waiting on a busy one"
+  ensure
+    waiter&.kill
+    waiter&.join
+  end
+
+  def open_lock_descriptors
+    ObjectSpace.each_object(File).reject(&:closed?).select { _1.path.start_with?(@dir) && _1 != @held_lock }.map { [_1.path, _1.fileno] }
   end
 end

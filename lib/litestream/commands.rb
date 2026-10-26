@@ -1,5 +1,8 @@
+require "date"
+require "fileutils"
 require "json"
 require "open3"
+require "yaml"
 require_relative "upstream"
 
 module Litestream
@@ -256,12 +259,30 @@ module Litestream
       # into the parent too, and the Puma plugin wrapped that in a fork of its
       # own, so it recorded a pid that exited immediately while the daemon was
       # reparented to init and outlived Puma.
+      #
+      # Litestream 0.5.17 takes no lock on the database it replicates, and two
+      # replicate processes on one database can upload a corrupt LTX file that
+      # stalls compaction for good (#84). A deploy that starts the new container
+      # before stopping the old one runs exactly that, so replicate first waits
+      # for an exclusive lock for each database. The lock files are handed to
+      # the litestream process and closed here, so litestream holds them: one
+      # that outlives a SIGKILLed Puma or rake still keeps the next one out.
+      # With -exec, the command litestream starts inherits them as well (Go
+      # passes on every descriptor it was given), so the lock is free once both
+      # have exited. Holding it here instead would not end it sooner: the rake
+      # task reads litestream's output until that command closes it too.
       def run_replicate(cmd, async:)
+        locks = lock_databases(lock_paths(cmd))
+        redirects = locks.to_h { [_1, _1] }
+
         if async
-          Process.spawn(*cmd)
+          pid = Process.spawn(*cmd, **redirects)
+          locks.each(&:close)
+          pid
         else
           # When running in-process, we capture output continuously and write to stdout.
-          IO.popen(cmd, err: [:child, :out]) do |io|
+          IO.popen(cmd, err: [:child, :out], **redirects) do |io|
+            locks.each(&:close)
             io.each_line { |line| puts line }
           end
           status = $?
@@ -272,6 +293,110 @@ module Litestream
           if status && !status.success? && !status.signaled?
             raise CommandFailedException, "Failed to execute `replicate` (exit status #{status.exitstatus})"
           end
+        end
+      ensure
+        locks&.each { _1.close unless _1.closed? }
+      end
+
+      # One lock file per database in the config file the command names, kept
+      # where Litestream keeps that database's state, so it is on the volume
+      # the containers share: `.<db>-litestream.lock` beside the database's
+      # `.<db>-litestream` directory, or beside its `meta-path:`. A `dir:` entry
+      # gets one `.litestream.lock` inside the directory (or its `meta-dir:` or
+      # `meta-path:`), which Litestream does not take for a database because it
+      # is not one. `litestream databases` would be the obvious source, but
+      # 0.5.17 reports a `dir:` entry as the working directory and refuses one
+      # that sets `meta-dir:`.
+      #
+      # Paths are read the way Litestream reads them: environment variables
+      # expanded unless -no-expand-env, relative paths from the working
+      # directory. Litestream's `$PID` and `$$` are left alone, and `~user` is
+      # expanded, neither of which a database path has a use for. An entry that
+      # Litestream would refuse is skipped, and Litestream exits with the error.
+      def lock_paths(cmd)
+        config_path = nil
+        expand_env = true
+        args = cmd.drop(2)
+        args.each_with_index do |arg, index|
+          case arg
+          when "-config", "--config" then config_path = args[index + 1]
+          when /\A--?config=(.*)\z/ then config_path = $1
+          when "-no-expand-env", "--no-expand-env" then expand_env = false
+          end
+        end
+        return [] unless config_path && File.file?(config_path)
+
+        yaml = File.read(config_path)
+        yaml = yaml.gsub(/\$(?:\{(\w+)\}|(\w+))/) { ENV.fetch($1 || $2, "") } if expand_env
+        # Safe loading is enough for the few keys read here, and environment
+        # values are spliced into the text before it is parsed, so this must not
+        # build arbitrary objects. Go's YAML reads `:debug` and dates as strings;
+        # Psych needs them permitted.
+        config = YAML.safe_load(yaml, aliases: true, permitted_classes: [Date, Time, Symbol])
+        dbs = config.is_a?(Hash) ? config["dbs"] : nil
+        return [] unless dbs.is_a?(Array)
+
+        dbs.grep(Hash).filter_map do |db|
+          if db["dir"]
+            File.join(expand_path(db["meta-dir"] || db["meta-path"] || db["dir"]), ".litestream.lock")
+          elsif db["path"]
+            path = expand_path(db["path"])
+            meta_path = db["meta-path"] ? expand_path(db["meta-path"]) : File.join(File.dirname(path), ".#{File.basename(path)}-litestream")
+            "#{meta_path}.lock"
+          end
+        end
+      rescue Psych::Exception => error
+        raise CommandFailedException, "Failed to read #{config_path} to lock its databases: #{error.message}"
+      end
+
+      def expand_path(path)
+        File.expand_path(path.to_s.sub(%r{\Asqlite3?://}, ""))
+      end
+
+      LOCK_RETRY_INTERVAL = 0.5
+
+      # Takes every lock or none: while another replicate holds one, all are
+      # closed and tried again shortly. So two waiters can't each hold a lock
+      # the other needs, and nothing is held open while waiting, which Puma
+      # would otherwise pass to every worker it forks meanwhile, and a worker
+      # would then hold the lock after litestream exits. That leaves only the
+      # moment from taking the locks to closing them after the spawn, about a
+      # millisecond: a worker forked then inherits them and holds them until it
+      # exits (in a test, 30 of 4,153 forks did). Under fork_worker a worker 0
+      # forked then keeps them across later reforks, so the litestream started
+      # after a refork waits until that worker exits.
+      #
+      # The files are opened read-only and created 0644, so containers sharing
+      # a uid, as containers of one image do, can open one another's. The wait
+      # stays interruptible where the caller defers interrupts: the Puma plugin
+      # does, so that stopping Puma either finds the litestream it started or
+      # keeps it from starting.
+      def lock_databases(lock_paths)
+        lock_paths = lock_paths.uniq.sort
+        waited = false
+        loop do
+          locks = []
+          acquired = false
+          begin
+            busy = lock_paths.find do |lock_path|
+              FileUtils.mkdir_p(File.dirname(lock_path))
+              locks << (lock = File.open(lock_path, File::RDONLY | File::CREAT, 0o644))
+              !lock.flock(File::LOCK_EX | File::LOCK_NB)
+            rescue SystemCallError => error
+              raise CommandFailedException, "Failed to lock #{lock_path} before replicating: #{error.message}"
+            end
+            unless busy
+              warn "Locked #{lock_paths.join(", ")}, starting `litestream replicate`" if waited
+              acquired = true
+              return locks
+            end
+          ensure
+            locks.each(&:close) unless acquired
+          end
+
+          warn "Waiting for #{busy}: another `litestream replicate` holds it" unless waited
+          waited = true
+          Thread.handle_interrupt(Object => :immediate) { sleep LOCK_RETRY_INTERVAL }
         end
       end
     end

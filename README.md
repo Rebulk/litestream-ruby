@@ -165,6 +165,12 @@ The simplest way to run the Litestream replication process is use the Puma plugi
 plugin :litestream if ENV.fetch("RAILS_ENV", "production") == "production"
 ```
 
+Before starting `litestream replicate`, the plugin waits for an exclusive lock for each database in your config, so that two replication processes never run on one database (see [#84](https://github.com/fractaledmind/litestream-ruby/issues/84)). On Kamal, the old and new containers share the database's volume, so the new container's replication starts as soon as the old one's stops. Puma boots and serves requests while it waits, and logs which lock it is waiting for and when it has it.
+
+The `litestream` process holds the lock itself, so it is released when that process exits, even if Puma was killed. The lock files are where Litestream keeps each database's state: `storage/.production.sqlite3-litestream.lock` beside `storage/production.sqlite3` (or beside its `meta-path:`), and `.litestream.lock` inside a `dir:` entry's directory (or its `meta-dir:`), which Litestream does not take for a database, even with `pattern: "*"`. They are created mode 0644 and opened read-only, so every process sharing them needs to read them; containers running one image share a uid, which is enough.
+
+Puma fires the same event before a hot restart and before a phased restart or refork, so the plugin stops Litestream for both, and during a phased restart nothing replicates until the workers have booted again.
+
 If you would prefer to run the Litestream replication process separately from Puma, you can use the provided `litestream:replicate` rake task. This rake task will automatically load the configuration file and set the environment variables before starting the Litestream process.
 
 The simplest way to spin up a Litestream process separately from your Rails application is to use a `Procfile`:
@@ -184,6 +190,8 @@ bin/rails litestream:replicate -- -exec "foreman start"
 ```
 
 This example utilizes the `-exec` option available on [the `replicate` command](https://litestream.io/reference/replicate/) which provides basic process management, since Litestream will exit when the child process exits. In this example, we only launch our collection of Rails application processes (like Rails and SolidQueue, for example) after the Litestream replication process is ready.
+
+`litestream:replicate` waits for the same lock as the Puma plugin before it starts Litestream. With `-exec`, the command does not start until any other replication of those databases has stopped. On Kamal that makes a deploy of a web role started this way fail: the new container's app never starts while the old container's Litestream holds the lock, and Kamal stops the old container only once the new one is healthy. Use the Puma plugin there, or run `litestream:replicate` as a role of its own. The command Litestream starts inherits the lock too, so the lock is released once both have exited.
 
 The Litestream `replicate` command supports the following options, which can be passed through the rake task:
 
@@ -507,7 +515,7 @@ The 0.5 `restore` command auto-detects both 0.3 and LTX backups and prefers whic
 
 These were found running 0.5.17 in production (see [#84](https://github.com/fractaledmind/litestream-ruby/issues/84)):
 
-- **Deploy overlap.** Litestream 0.5.17 takes no lock on the database it replicates. When a deploy starts the new container before stopping the old one, as Kamal does, both run `litestream replicate` against the same database until the old one stops. This can upload a corrupt LTX file. A lock in this gem is planned.
+- **Deploy overlap.** Litestream 0.5.17 takes no lock on the database it replicates, so two `litestream replicate` processes on one database, as a deploy that starts the new container before stopping the old one runs, can upload a corrupt LTX file. The Puma plugin and `litestream:replicate` prevent this by waiting for a lock first; see [Replication](#replication). A `litestream replicate` started outside this gem takes no lock.
 - **Stalled compaction.** A corrupt LTX file at level 0 makes every compaction that includes it fail, without any error your app would see, and level-0 files then pile up. Keep an eye on the count, for example from a recurring job:
 
   ```ruby

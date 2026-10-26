@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+- Wait for an exclusive lock for each database before replicating, in both the Puma plugin and `litestream:replicate`, so a deploy that starts the new container before stopping the old one no longer runs two `litestream replicate` processes on one database (#84). The Puma plugin waits in a thread of its own, so Puma boots and serves meanwhile; it still starts Litestream again after a phased restart or refork, and it stops Puma if Litestream can't be started. Stopping Puma before Litestream has started no longer raises. This breaks `litestream:replicate -- -exec "..."` as a Kamal web role: the new container's app now waits for the old container's Litestream to stop, and Kamal stops the old container only once the new one is healthy, so that deploy fails. Use the Puma plugin there, or run `litestream:replicate` as a role of its own ([@cole-robertson](https://github.com/fractaledmind/litestream-ruby/pull/XX))
+
 ## [0.16.1] - 2026-10-16
 
 - Stop Puma when Litestream exits, as documented: the Puma plugin's monitor was set up after Puma had started its background threads, so it never ran ([@cole-robertson](https://github.com/fractaledmind/litestream-ruby/pull/85))
