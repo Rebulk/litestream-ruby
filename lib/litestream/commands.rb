@@ -108,13 +108,18 @@ module Litestream
       # Replicate runs either as a child process or in the foreground, depending on the context.
       # The Puma plugin starts it as a child and gets its pid back; the rake task runs it in the
       # foreground and streams its output.
+      #
+      # A missing executable or install dir raises its own error from prepare,
+      # which used to be lost to a NoMethodError on the nil command.
       def replicate(async: false, **argv)
         cmd = prepare("replicate", argv)
-        run_replicate(cmd, async: async)
-      rescue CommandFailedException
-        raise
-      rescue
-        raise CommandFailedException, "Failed to execute `#{cmd.join(" ")}`"
+        begin
+          run_replicate(cmd, async: async)
+        rescue CommandFailedException
+          raise
+        rescue => error
+          raise CommandFailedException, "Failed to execute `#{cmd.join(" ")}`: #{error.message}"
+        end
       end
 
       def restore(database, **argv)

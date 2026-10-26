@@ -1040,6 +1040,23 @@ class TestReplicateLock < ActiveSupport::TestCase
     assert_equal [], lock_paths
   end
 
+  # replicate used to lose this to a NoMethodError on the nil command, which
+  # the Puma plugin did not stop Puma for.
+  def test_a_missing_executable_raises_its_own_error
+    @executable = nil
+
+    assert_raises(Litestream::Commands::ExecutableNotFoundException) { Litestream::Commands.replicate(async: true) }
+  end
+
+  def test_a_failed_spawn_names_the_reason
+    @executable = File.join(@dir, "missing")
+
+    error = assert_raises(Litestream::Commands::CommandFailedException) { Litestream::Commands.replicate(async: true) }
+
+    assert_match "No such file or directory", error.message
+    assert lock_free?
+  end
+
   def test_logs_once_while_waiting_and_once_when_locked
     hold_lock
     waiter = Thread.new { replicate(async: true) }

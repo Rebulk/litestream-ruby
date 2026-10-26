@@ -235,4 +235,16 @@ class TestLitestreamPlugin < ActiveSupport::TestCase
 
     assert_match "Litestream failed to start", message
   end
+
+  # It used to raise a NoMethodError the plugin did not catch, and Puma
+  # served with nothing replicating.
+  def test_stops_puma_when_the_executable_is_missing
+    ENV["LITESTREAM_INSTALL_DIR"] = File.join(@dir, "missing")
+
+    message = stops_puma_when_litestream_cannot_be_started
+
+    assert_match "LITESTREAM_INSTALL_DIR is set to", message
+  ensure
+    ENV.delete("LITESTREAM_INSTALL_DIR")
+  end
 end
